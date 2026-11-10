@@ -180,6 +180,47 @@ herdr --version
 
 应优先命中 `$HOME/.local/bin/herdr`。如果仍然命中 `/opt/homebrew/bin/herdr`，先调整 PATH，再重启本机 Herdr 客户端。Homebrew 版本可以保留作为回退，但不要让它覆盖自维护版本。
 
+本机这次已经卸载 Homebrew Herdr，`$HOME/.local/bin/herdr` 是指向源码 checkout
+中 `target/release/herdr` 的符号链接。Pairfob 的 launchd 配置也必须把 `HERDR_BIN`
+指向这个入口；只替换 PATH 不会改变 Pairfob 已保存的绝对路径。修改后重新加载
+`com.pairfob.pairfob.plist`，再检查 Pairfob 子进程实际加载的 Herdr 路径。
+
+旧的 Herdr TUI 进程可能仍然加载卸载前的 Homebrew 二进制。不要为了切换版本直接
+杀掉主 TUI 或其 server；先启动自维护版本并完成 live handoff，待旧窗口自然退出后，
+后续从 `$HOME/.local/bin/herdr` 启动即可。
+
+## Radar 工作区空白恢复
+
+如果 Herdr server 重启后侧栏仍显示 `Local`，但工作区下只有一个空白高亮行，先不要
+删除 session 或重建 workspace。这个症状通常表示 session 和 pane 仍在，Radar 没有把
+`$space_label`、`$space_logo_*` 等 metadata token 重新写回 Herdr；`space_rows()` 会为
+工作区保留高度，却因为 token 缺失而画出空白行。
+
+历史记录在 `~/.config/herdr/maintenance-backups/local-before-handoff.json`，其中保留了
+同一类“local 多会话未展示”现场。先用 CLI 确认数据仍在：
+
+```bash
+export HERDR_ENV=1
+$HOME/.local/bin/herdr workspace list
+$HOME/.local/bin/herdr agent list
+```
+
+如果 workspace/agent 列表正常但 token 缺失，重新执行当前 Radar 安装目录的三步启动链：
+
+```bash
+radar_root="$HOME/.config/herdr/plugins/github-installations/hhdebb.herdr-radar-afabda667cbe/16742-0/checkout"
+export HERDR_BIN_PATH="$HOME/.local/bin/herdr"
+node "$radar_root/bin/agent-icons.js"
+node "$radar_root/bin/agent-state.js"
+node "$radar_root/bin/agent-view.js" --reapply
+```
+
+恢复后检查 `agent-state.js` 进程、`~/.local/state/herdr/plugins/hhdebb.herdr-radar/animator.err`
+以及 Herdr server 日志中的 `workspace.report_metadata`。`herdr workspace list` 应重新出现
+`space_label` 和相应的 `space_logo_*` token。这个恢复操作属于本机 Radar 运行时维护，
+不需要修改 Herdr 源码，也不需要在其他节点重建会话；只有同样出现 token 丢失的节点才需要
+执行对应节点的恢复命令。
+
 ## 哪些机器需要更新
 
 这次修复位于 `src/raw_input.rs`，解决的是本地 TUI 输入分帧问题。运行自维护 Herdr TUI 的节点需要使用 fork 构建；仅作为远端 server、SSH 端点或 Pairfob relay 的机器不因为这个客户端修复而自动需要更换二进制。
