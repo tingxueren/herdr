@@ -204,6 +204,9 @@ pub(crate) struct RawInputByteFramer {
     // Keep the discarded prefix separate from continuation bytes awaiting validation.
     timed_out_mouse_prefix: Option<Vec<u8>>,
     lone_escape_recently_flushed: bool,
+    /// A lone `[` can be the next read of an orphaned `ESC[<...` mouse report.
+    /// Keep it through one long split-read window before treating it as a key.
+    orphaned_sgr_mouse_bracket_held: bool,
     host_color_replies_awaited: u16,
     #[cfg(windows)]
     host_default_color_query_issued: bool,
@@ -460,7 +463,7 @@ impl RawInputByteFramer {
     /// How long to keep holding input after a first idle flush held it.
     #[cfg(unix)]
     pub(crate) fn held_input_flush_timeout_ms(&self) -> i32 {
-        if self.awaiting_mouse_tail_after.is_some() {
+        if self.awaiting_mouse_tail_after.is_some() || self.orphaned_sgr_mouse_bracket_held {
             DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS
         } else {
             RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS
@@ -520,6 +523,22 @@ impl RawInputByteFramer {
             return chunks;
         }
 
+        // A delayed SGR mouse report may arrive as `ESC`, `[`, and the
+        // parameter tail in separate reads. `drain_available_chunks` already
+        // recognizes `[` as an orphaned mouse prefix; keep it for the long
+        // split-read window instead of dropping it as an incomplete buffer.
+        // If no tail arrives during that window, release the real `[` key.
+        if self.lone_escape_recently_flushed && self.buffer == b"[" {
+            if self.orphaned_sgr_mouse_bracket_held {
+                self.orphaned_sgr_mouse_bracket_held = false;
+                self.lone_escape_recently_flushed = false;
+                chunks.push(std::mem::take(&mut self.buffer));
+            } else {
+                self.orphaned_sgr_mouse_bracket_held = true;
+            }
+            return chunks;
+        }
+
         // A confirmed host sends Escape as `CSI 27u`, so a mouse report prefix
         // that outlives keyboard timing may still get a delayed tail (#3480).
         // Keep it briefly; `push` releases it if other input follows.
@@ -550,6 +569,7 @@ impl RawInputByteFramer {
             prefix.append(&mut self.buffer);
             self.retain_timed_out_mouse_prefix(prefix);
             self.lone_escape_recently_flushed = false;
+            self.orphaned_sgr_mouse_bracket_held = false;
             return chunks;
         }
 
@@ -740,6 +760,7 @@ impl RawInputByteFramer {
 
         tracing::debug!(bytes = ?self.buffer, "dropping incomplete raw input buffer after timeout");
         self.lone_escape_recently_flushed = false;
+        self.orphaned_sgr_mouse_bracket_held = false;
         self.buffer.clear();
         chunks
     }
@@ -771,9 +792,11 @@ impl RawInputByteFramer {
                 }
                 if discard_complete_orphaned_sgr_mouse_tail(&mut self.buffer) {
                     self.lone_escape_recently_flushed = false;
+                    self.orphaned_sgr_mouse_bracket_held = false;
                     continue;
                 }
                 self.lone_escape_recently_flushed = false;
+                self.orphaned_sgr_mouse_bracket_held = false;
             }
 
             if let Some(family) = self.discard_until {
@@ -2716,6 +2739,34 @@ mod tests {
         );
 
         assert!(framer.push(b"[<65;43;26M").is_empty());
+    }
+
+    #[test]
+    fn split_sgr_mouse_tail_after_lone_escape_timeout_is_discarded() {
+        let mut framer = RawInputFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout().len(), 1);
+
+        assert!(framer.push(b"[").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.push(b"<65;43;26M").is_empty());
+    }
+
+    #[test]
+    fn orphaned_sgr_mouse_bracket_prefix_is_released_after_split_window() {
+        let mut framer = RawInputByteFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout().len(), 1);
+        assert!(framer.push(b"[").is_empty());
+
+        assert!(framer.flush_timeout().is_empty());
+        assert_eq!(
+            framer.flush_timeout(),
+            vec![b"[".to_vec()],
+            "a bracket without a mouse tail must eventually become a key"
+        );
     }
 
     #[test]
