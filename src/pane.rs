@@ -102,10 +102,25 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // that launched the app. Advertising the inherited TERM leaks the host terminal
     // identity into shells and across SSH, which breaks redraw and cursor movement
     // when the remote side lacks matching terminfo entries.
+    // A server launched without a terminal may inherit `NO_COLOR` together
+    // with `TERM=dumb` (or no TERM at all). Keep an interactive user's
+    // explicit `NO_COLOR` preference, but remember whether this launch looks
+    // non-interactive before replacing TERM below.
+    let inherited_no_color = cmd.get_env("NO_COLOR").is_some();
+    let inherited_term_is_non_interactive = cmd
+        .get_env("TERM")
+        .is_none_or(|term| term == std::ffi::OsStr::new("dumb"));
+
     cmd.env("TERM", PANE_TERM);
     cmd.env("COLORTERM", PANE_COLORTERM);
     cmd.env("TERM_PROGRAM", "herdr");
     cmd.env("TERM_PROGRAM_VERSION", crate::build_info::version());
+    // `NO_COLOR` from a headless launcher describes the absent outer terminal,
+    // not the pane terminal Herdr provides. An explicit pane launch env is
+    // applied afterwards and can still opt a specific command back in.
+    if inherited_no_color && inherited_term_is_non_interactive {
+        cmd.env_remove("NO_COLOR");
+    }
     // fish only skips its own resize repaint for terminals it recognizes as
     // reflowing. Herdr reflows too, and the competing repaint glues prompt copies.
     // Match the exact casing: Windows env keys are case-insensitive here, but
@@ -4411,6 +4426,40 @@ mod tests {
             cmd.get_env(FISH_HANDLE_REFLOW_ENV_VAR),
             Some(OsStr::new("0"))
         );
+    }
+
+    #[test]
+    fn pane_terminal_env_does_not_inherit_no_color() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("NO_COLOR", "1");
+        cmd.env("TERM", "dumb");
+
+        apply_pane_terminal_env(&mut cmd);
+
+        assert!(cmd.get_env("NO_COLOR").is_none());
+    }
+
+    #[test]
+    fn pane_terminal_env_preserves_no_color_from_interactive_host() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("NO_COLOR", "1");
+        cmd.env("TERM", "xterm-256color");
+
+        apply_pane_terminal_env(&mut cmd);
+
+        assert_eq!(cmd.get_env("NO_COLOR"), Some(OsStr::new("1")));
+    }
+
+    #[test]
+    fn pane_launch_env_can_explicitly_enable_no_color() {
+        let mut cmd = CommandBuilder::new("shell");
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(
+            &mut cmd,
+            &PaneLaunchEnv::from_extra(vec![("NO_COLOR".into(), "1".into())]),
+        );
+
+        assert_eq!(cmd.get_env("NO_COLOR"), Some(OsStr::new("1")));
     }
 
     #[test]
