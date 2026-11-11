@@ -1565,6 +1565,16 @@ impl App {
         if let Err(message) = validate_optional_resume_argv(params.resume_argv.as_deref()) {
             return encode_error(id, "invalid_resume_argv", message);
         }
+        if let Some(message) = self.session_cwd_conflict_message(
+            ws_idx,
+            pane_id,
+            &params.source,
+            &agent_label,
+            params.agent_session_id.as_deref(),
+            params.agent_session_path.as_deref(),
+        ) {
+            return encode_error(id, "agent_session_cwd_mismatch", message);
+        }
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
@@ -1610,6 +1620,16 @@ impl App {
         if let Err(message) = validate_optional_resume_argv(params.resume_argv.as_deref()) {
             return encode_error(id, "invalid_resume_argv", message);
         }
+        if let Some(message) = self.session_cwd_conflict_message(
+            ws_idx,
+            pane_id,
+            &params.source,
+            &agent_label,
+            params.agent_session_id.as_deref(),
+            params.agent_session_path.as_deref(),
+        ) {
+            return encode_error(id, "agent_session_cwd_mismatch", message);
+        }
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
@@ -1640,6 +1660,34 @@ impl App {
             params.seq.filter(|_| applied),
             applied.then_some(params.resume_argv).flatten(),
         )
+    }
+
+    fn session_cwd_conflict_message(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        source: &str,
+        agent: &str,
+        session_id: Option<&str>,
+        transcript: Option<&str>,
+    ) -> Option<String> {
+        let session = crate::agent_resume::AgentSessionRef::id(session_id?)?;
+        let terminal = self.pane_terminal(ws_idx, pane_id)?;
+        let cwd = self
+            .lookup_runtime(ws_idx, pane_id)
+            .and_then(|(runtime, _)| runtime.foreground_cwd().or_else(|| runtime.cwd()))
+            .unwrap_or_else(|| terminal.cwd.clone());
+        let conflict = crate::agent_session_cwd::conflict(
+            source,
+            agent,
+            &session,
+            transcript.map(std::path::Path::new),
+            &cwd,
+        )?;
+        tracing::warn!(agent, session_id = %session.value, pane_cwd = %cwd.display(),
+            session_directories = ?conflict.session_directories, "rejected cross-project agent session report");
+        Some(format!("Session directory {:?} does not match pane directory {}. Session binding was not changed.",
+            conflict.session_directories, cwd.display()))
     }
 
     /// A resume command belongs to the session it was reported with, so it is

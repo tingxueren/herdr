@@ -8028,6 +8028,108 @@ fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
     );
 }
 
+#[test]
+fn api_session_cwd_guard_rejects_cross_project_reports_without_mutation() {
+    for agent in ["codex", "claude", "qodercli"] {
+        for state_report in [false, true] {
+            let dir = crate::agent_session_cwd::TestDir::new();
+            let pane_cwd = dir.path().join("Dorm");
+            let session_cwd = dir.path().join("platform");
+            std::fs::create_dir_all(&pane_cwd).unwrap();
+            std::fs::create_dir_all(&session_cwd).unwrap();
+            let transcript = dir.path().join("session.jsonl");
+            let record = if agent == "codex" {
+                serde_json::json!({"type":"session_meta", "payload":{
+                    "id":"foreign-session", "cwd":session_cwd}})
+            } else {
+                serde_json::json!({"type":"user", "sessionId":"foreign-session", "cwd":session_cwd})
+            };
+            std::fs::write(&transcript, format!("{record}\n")).unwrap();
+            let (writer, _, _) = test_client_writer();
+            let (mut server, pane_id) = completion_guard_server(writer);
+            let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+            let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.cwd = pane_cwd;
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: format!("herdr:{agent}"),
+                agent: agent.into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("original-session").unwrap(),
+            });
+            let method = if state_report {
+                api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                    pane_id: public_pane_id,
+                    source: format!("herdr:{agent}"),
+                    agent: agent.into(),
+                    state: api::schema::PaneAgentState::Working,
+                    message: None,
+                    seq: Some(10),
+                    agent_session_id: Some("foreign-session".into()),
+                    agent_session_path: Some(transcript.to_string_lossy().into()),
+                    resume_argv: Some(vec![
+                        agent.into(),
+                        "resume".into(),
+                        "foreign-session".into(),
+                    ]),
+                })
+            } else {
+                api::schema::Method::PaneReportAgentSession(
+                    api::schema::PaneReportAgentSessionParams {
+                        pane_id: public_pane_id,
+                        source: format!("herdr:{agent}"),
+                        agent: agent.into(),
+                        seq: Some(10),
+                        agent_session_id: Some("foreign-session".into()),
+                        agent_session_path: Some(transcript.to_string_lossy().into()),
+                        session_start_source: Some("resume".into()),
+                        resume_argv: Some(vec![
+                            agent.into(),
+                            "resume".into(),
+                            "foreign-session".into(),
+                        ]),
+                    },
+                )
+            };
+            let (respond_to, response_rx) = std::sync::mpsc::channel();
+            server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                request: api::schema::Request {
+                    id: "cwd-guard".into(),
+                    method: method.clone(),
+                },
+                respond_to,
+                response_write_complete: None,
+            });
+            let response = response_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(
+                response.contains("agent_session_cwd_mismatch"),
+                "{agent}: {response}"
+            );
+            let terminal = &server.app.state.terminals[&terminal_id];
+            assert!(terminal.session_ref_is_current(
+                &crate::agent_resume::AgentSessionRef::id("original-session").unwrap()
+            ));
+            assert!(terminal.hook_report_is_newer(&format!("herdr:{agent}"), Some(10)));
+            assert!(terminal.reported_resume().is_none());
+            let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.cwd = session_cwd;
+            terminal.persisted_agent_session = None;
+            server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+                pane_id,
+                agent: crate::detect::parse_agent_label(agent).unwrap(),
+                observed_at: Instant::now(),
+            });
+            completion_guard_api_report(&mut server, method);
+            assert!(
+                server.app.state.terminals[&terminal_id].session_ref_is_current(
+                    &crate::agent_resume::AgentSessionRef::id("foreign-session").unwrap()
+                )
+            );
+        }
+    }
+}
+
 fn completion_guard_notifications(
     server: &mut HeadlessServer,
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,

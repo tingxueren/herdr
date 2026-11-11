@@ -19,6 +19,10 @@ pub(crate) use env::integration_env_lock;
 pub(crate) use env::{
     apply_pane_base_env, HERDR_PANE_ID_ENV_VAR, HERDR_TAB_ID_ENV_VAR, HERDR_WORKSPACE_ID_ENV_VAR,
 };
+pub(crate) use env::{
+    claude_dir as session_store_claude_dir, codex_dir as session_store_codex_dir,
+    qodercli_dir as session_store_qoder_dir,
+};
 pub(crate) use registry::{
     experimental_letta_integration_status, installed_integration_statuses,
     integration_recommendations, integration_target_label, print_outdated_update_notice,

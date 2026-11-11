@@ -540,6 +540,31 @@ fn restore_tab(
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
+        // Imported PTYs already own running processes; this guard is for cold
+        // restore only. Never resume a known foreign session in this directory.
+        let cwd_conflict = if has_import {
+            None
+        } else {
+            saved_agent_session.and_then(|session| {
+                let persisted = persisted_agent_session_from_snapshot(session)?;
+                crate::agent_session_cwd::conflict(
+                    &session.source,
+                    &session.agent,
+                    &persisted.session_ref,
+                    None,
+                    &cwd,
+                )
+            })
+        };
+        if let Some(conflict) = &cwd_conflict {
+            warn!(pane_cwd = %cwd.display(), session_directories = ?conflict.session_directories,
+                "skipping cross-project agent restore; leaving a shell without the conflicting session binding");
+        }
+        let (saved_agent_session, saved_agent_resume) = filter_restore_session_metadata(
+            saved_agent_session,
+            saved_agent_resume,
+            cwd_conflict.is_some(),
+        );
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -808,6 +833,21 @@ fn restore_tab(
         )),
         failed_imports,
     )
+}
+
+fn filter_restore_session_metadata<'a>(
+    session: Option<&'a PaneAgentSessionSnapshot>,
+    resume: Option<&'a PaneAgentResumeSnapshot>,
+    cwd_conflict: bool,
+) -> (
+    Option<&'a PaneAgentSessionSnapshot>,
+    Option<&'a PaneAgentResumeSnapshot>,
+) {
+    if cwd_conflict {
+        (None, None)
+    } else {
+        (session, resume)
+    }
 }
 
 fn pane_restore_startup<'a>(
@@ -1248,6 +1288,59 @@ mod tests {
     }
 
     #[test]
+    fn session_cwd_guard_blocks_both_restore_commands_and_persisted_binding() {
+        let tmp = crate::agent_session_cwd::TestDir::new();
+        let original = tmp.path().join("platform");
+        let wrong = tmp.path().join("Dorm");
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::json!({
+                "type":"session_meta", "payload":{"id":"session", "cwd":original}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let session = PaneAgentSessionSnapshot {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "session".into(),
+        };
+        let resume = PaneAgentResumeSnapshot {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "session".into()],
+        };
+        for (cwd, blocked) in [(&wrong, true), (&original, false)] {
+            let persisted = persisted_agent_session_from_snapshot(&session).unwrap();
+            let conflict = crate::agent_session_cwd::conflict(
+                &session.source,
+                &session.agent,
+                &persisted.session_ref,
+                Some(&transcript),
+                cwd,
+            );
+            let (saved_session, saved_resume) =
+                filter_restore_session_metadata(Some(&session), Some(&resume), conflict.is_some());
+            let mut resumed = HashSet::new();
+            let mut restore_state = AgentRestoreState {
+                enabled: true,
+                resumed_sessions: &mut resumed,
+            };
+            let startup =
+                pane_restore_startup(saved_session, saved_resume, cwd, None, &mut restore_state);
+            assert_eq!(startup.restore_plan.is_none(), blocked);
+            assert_eq!(
+                restored_terminal_agent_session(saved_session, false).is_none(),
+                blocked
+            );
+            assert_eq!(saved_resume.is_none(), blocked);
+            assert_eq!(resumed.is_empty(), blocked);
+        }
+    }
+
+    #[test]
     fn pane_restore_startup_suppresses_history_for_duplicate_native_agent_session() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
             source: "herdr:pi".into(),
@@ -1601,6 +1694,71 @@ mod tests {
         assert_eq!(session.source, "herdr:opencode");
         assert_eq!(session.agent, "opencode");
         assert_eq!(session.session_ref.value, "opencode-session");
+    }
+
+    #[tokio::test]
+    async fn session_cwd_guard_cold_restore_checks_legacy_snapshot_against_store() {
+        let _lock = crate::integration::integration_env_lock();
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 {
+                    std::env::set_var("CODEX_HOME", value);
+                } else {
+                    std::env::remove_var("CODEX_HOME");
+                }
+            }
+        }
+        let _home = RestoreHome(std::env::var_os("CODEX_HOME"));
+        let tmp = crate::agent_session_cwd::TestDir::new();
+        let original = tmp.path().join("platform");
+        let wrong = tmp.path().join("Dorm");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&wrong).unwrap();
+        std::env::set_var("CODEX_HOME", tmp.path());
+        let transcript = tmp
+            .path()
+            .join("sessions/2026/11/11/rollout-date-session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            serde_json::json!({
+                "type":"session_meta", "payload":{"id":"session", "cwd":original}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for (cwd, blocked) in [(&wrong, true), (&original, false)] {
+            // No new fields: this is the same poisoned pair written by old servers.
+            let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+                "version":3, "active":0, "selected":0,
+                "workspaces":[{"identity_cwd":cwd, "tabs":[{
+                    "layout":{"Pane":0}, "zoomed":false,
+                    "panes":{"0":{"cwd":cwd,
+                        "agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"session"},
+                        "agent_resume":{"source":"herdr:codex","agent":"codex","argv":["codex","resume","session"]}
+                    }}
+                }]}]
+            })).unwrap();
+            let (events, _event_rx) = mpsc::channel(4);
+            let (_, terminals, _runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals.values().next().unwrap();
+            assert_eq!(terminal.pending_agent_resume_plan.is_none(), blocked);
+            assert_eq!(terminal.persisted_agent_session.is_none(), blocked);
+            assert_eq!(terminal.reported_resume().is_none(), blocked);
+        }
     }
 
     #[tokio::test]

@@ -24,6 +24,30 @@ pub fn is_preview() -> bool {
     channel() == "preview"
 }
 
+/// Human-readable provenance without changing upstream release/channel identity
+/// used by endpoint negotiation and remote asset selection.
+pub fn display_version() -> String {
+    let version = version();
+    match non_empty(option_env!("HERDR_FORK_ID")) {
+        Some(fork) => format!(
+            "{version} (fork {fork}; commit {}; built {})",
+            non_empty(option_env!("HERDR_FORK_REVISION")).unwrap_or("unknown"),
+            fork_build_time().unwrap_or_else(|| "unknown".into())
+        ),
+        None => version,
+    }
+}
+
+fn fork_build_time() -> Option<String> {
+    let epoch = non_empty(option_env!("HERDR_FORK_BUILD_EPOCH"))?
+        .parse()
+        .ok()?;
+    time::OffsetDateTime::from_unix_timestamp(epoch)
+        .ok()?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.and_then(|value| {
         let trimmed = value.trim();

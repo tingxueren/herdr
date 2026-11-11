@@ -12,6 +12,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 ];
 
 mod agent_resume;
+mod agent_session_cwd;
 mod agent_view_eval;
 mod api;
 mod app;
@@ -724,7 +725,7 @@ fn main() -> io::Result<()> {
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         platform::begin_cli_output();
-        println!("herdr {}", crate::build_info::version());
+        println!("herdr {}", crate::build_info::display_version());
         return Ok(());
     }
 

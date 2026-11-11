@@ -167,7 +167,7 @@ CARGO_INCREMENTAL=1 cargo build --release --locked --timings
 
 它保留 release 默认优化级别，为本次构建启用 Rust 增量编译，并把耗时报告保存到
 `target/cargo-timings/`（设置 `CARGO_TARGET_DIR` 时位于对应目录下）。产物仍是
-`target/release/herdr`，与本机已有安装链接一致。`just build` 保留原有行为，
+`target/release/herdr`，安装时复制到 `~/.local/bin/herdr`。`just build` 保留原有行为，
 需要按默认 release 设置验证时使用；CI 和发布构建不通过这个本地入口。
 
 首次启用增量编译需要建立缓存，后续以相同参数修改代码再构建时才能评估提速效果。
@@ -181,7 +181,29 @@ CARGO_INCREMENTAL=1 cargo build --release --locked --timings
 
 release 优化构建可能明显慢于 debug 测试。构建开始后应先看 `ps` 确认仍有 `rustc` 或 `zig` 活动，不要把长时间没有终端输出误判成死锁。
 
-## 本机安装方式
+dorm-dev 的工具链保存在持久化 home 中：Rust 1.96.1 位于 `~/.cargo/bin`，
+Zig 0.16.0 位于 `~/.local/share/herdr/zig-0.16.0/zig`，`just` 位于 `~/.local/bin`。
+在该节点构建时使用：
+
+```bash
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export ZIG="$HOME/.local/share/herdr/zig-0.16.0/zig"
+export LIBGHOSTTY_VT_ZIG_SYSTEM_DIR="$HOME/herdr-zig-system"
+just build-local
+```
+
+维护脚本测试使用支持 `tomllib` 的 Python，例如
+`just --set python 'uv run --offline --no-project python' maintenance-test`。
+
+## Fork 标识与三机安装方式
+
+`just build-local` 默认嵌入 `tingxueren/herdr`、源码 commit ID 和实际构建开始时间
+（UTC，ISO 8601）。有未提交改动时，commit 后附 `dirty` 和源码差异摘要；摘要包含
+未跟踪源码、文件删除和路径变化。`herdr --version` 展示这些信息。上游基础版本、
+更新 channel 和协议版本保持原有含义，fork 标识不冒充上游 preview。
+
+Mac 本机、`mini`（macOS arm64）、`dorm-dev`（Linux x86_64）均安装本 fork。
+两个 Mac 可使用同一份 arm64 产物，Linux 必须使用 Linux 产物。
 
 本地自维护版本安装到：
 
@@ -189,14 +211,20 @@ release 优化构建可能明显慢于 debug 测试。构建开始后应先看 `
 $HOME/.local/bin/herdr
 ```
 
-macOS 上不要把 ad-hoc 签名的 release Mach-O 直接复制到新的路径；在本机验证过，复制后的文件可能在 `dyld` 阶段卡住，而原始构建路径可以正常启动。使用符号链接：
+按当前约定，该路径必须是普通可执行文件，不再使用符号链接。旧版本保留备份。
+macOS 曾出现复制后的 Mach-O 无法正常启动，因此复制到目标机器后先重新做 ad-hoc
+签名、检查签名并验证 `--version`，再原子替换正式入口：
 
 ```bash
 mkdir -p "$HOME/.local/bin"
+cp target/release/herdr "$HOME/.local/bin/herdr.new"
+codesign --force --sign - "$HOME/.local/bin/herdr.new"
+codesign --verify --strict "$HOME/.local/bin/herdr.new"
+"$HOME/.local/bin/herdr.new" --version
 if [ -e "$HOME/.local/bin/herdr" ] || [ -L "$HOME/.local/bin/herdr" ]; then
-  mv "$HOME/.local/bin/herdr" "$HOME/.local/bin/herdr.binary-copy-$(date +%Y%m%d-%H%M%S)"
+  mv "$HOME/.local/bin/herdr" "$HOME/.local/bin/herdr.before-fork-$(date +%Y%m%d-%H%M%S)"
 fi
-ln -s "$HOME/Work/Git/herdr/target/release/herdr" "$HOME/.local/bin/herdr"
+mv "$HOME/.local/bin/herdr.new" "$HOME/.local/bin/herdr"
 ```
 
 验证 PATH 和版本：
@@ -209,8 +237,8 @@ herdr --version
 
 应优先命中 `$HOME/.local/bin/herdr`。如果仍然命中 `/opt/homebrew/bin/herdr`，先调整 PATH，再重启本机 Herdr 客户端。Homebrew 版本可以保留作为回退，但不要让它覆盖自维护版本。
 
-本机这次已经卸载 Homebrew Herdr，`$HOME/.local/bin/herdr` 是指向源码 checkout
-中 `target/release/herdr` 的符号链接。Pairfob 的 launchd 配置也必须把 `HERDR_BIN`
+本机已经卸载 Homebrew Herdr。`mini` 若仍保留 Homebrew 包作为回退，应 unlink，
+确保 `command -v herdr` 命中 `~/.local/bin/herdr`。Pairfob 的 launchd 配置也必须把 `HERDR_BIN`
 指向这个入口；只替换 PATH 不会改变 Pairfob 已保存的绝对路径。修改后重新加载
 `com.pairfob.pairfob.plist`，再检查 Pairfob 子进程实际加载的 Herdr 路径。
 
@@ -219,6 +247,19 @@ herdr --version
 后续从 `$HOME/.local/bin/herdr` 启动即可。
 
 ## Radar 工作区空白恢复
+
+切换前也要核对本机 `~/.config/herdr/README.md` 的运行故障记录。2026-11-11
+记录过从非交互环境启动 server 导致 Codex 无颜色的问题：继承了 `TERM=dumb`
+和 `NO_COLOR=1`。本次构建包含原有 `src/pane.rs` 修复：pane 创建时只清除来自
+非交互环境的 `NO_COLOR`，保留交互终端的用户设置和显式 pane launch env。
+后续隔离构建必须保留这项颜色修复。
+
+live handoff 的 import 进程继承旧 server 环境，并非发出 API 请求的 CLI 环境；
+仅对请求命令执行 `env -u NO_COLOR` 不能清除旧 server 已有的变量。切换前核对
+旧 server 的终端环境和 Node 可用路径；需要补齐 Node 时使用各节点已有的
+`~/.config/herdr/maintenance/with-runtime.sh` 启动链，不复制其他节点的 NVM 路径。
+切换后检查 pane/shell PID 保留、Radar token 和 Pairfob 服务状态；不要通过向运行中
+agent 注入 `unset` 或退出会话来做颜色检查。
 
 如果 Herdr server 重启后侧栏仍显示 `Local`，但工作区下只有一个空白高亮行，先不要
 删除 session 或重建 workspace。这个症状通常表示 session 和 pane 仍在，Radar 没有把
@@ -250,11 +291,36 @@ node "$radar_root/bin/agent-view.js" --reapply
 不需要修改 Herdr 源码，也不需要在其他节点重建会话；只有同样出现 token 丢失的节点才需要
 执行对应节点的恢复命令。
 
+## 会话工作目录保护
+
+共享 app-server 可能继承启动它的 pane 环境，使别的 Codex 会话 ID 被写到该 pane。
+此次保护保留 Codex app-server 和 Remote Control，不修改它们的配置或停止 daemon。
+
+- Codex：读取 rollout 的原始 `session_meta.id/cwd`，不依赖错误恢复后可能已改变的数据库 cwd。
+- Claude：从 transcript 中读取匹配 `sessionId` 的 cwd，跳过没有目录的前导记录。
+- Qoder：读取匹配 `sessionId` 的 `workspace-directories`，支持多个明确工作目录；旧记录可读取 cwd。
+- 两个 session 上报入口和冷启动恢复共用校验。明确目录冲突的报告返回
+  `agent_session_cwd_mismatch`，不改变有效绑定；恢复时跳过该会话及其恢复命令，留下 shell，
+  并记录日志。运行中 PTY 的 live handoff 不按冷启动处理。
+- 不变更已发布 API、冻结 codec 或快照格式。旧快照也会在恢复时查询原生会话目录。
+
+限制：目录一致不能证明 pane 归属，同目录多个会话仍需可靠的客户端 thread ID。
+元数据缺失、格式不支持或超过读取上限时按兼容策略放行，属于未验证，而非验证通过。
+读取仅发生于上报和恢复边界；单文件最多 1 MiB / 256 行，目录发现最多 16384 项。
+符号链接目录通过 canonicalize 比较；不以路径前缀、父目录或 Git root 猜测归属。
+用户主动跨目录继续旧会话仍可手动运行，但没有可信迁移记录时，之后的自动恢复可能被
+原始目录校验阻止。任意自定义 `resume_argv` 的语义无法仅凭目录推断；此保护针对
+原生会话 ID。已经错绑的历史记录不会被自动搬到另一个 pane。
+
 ## 哪些机器需要更新
 
-这次修复位于 `src/raw_input.rs`，解决的是本地 TUI 输入分帧问题。运行自维护 Herdr TUI 的节点需要使用 fork 构建；仅作为远端 server、SSH 端点或 Pairfob relay 的机器不因为这个客户端修复而自动需要更换二进制。
+分片鼠标修复位于 `src/raw_input.rs`，作用于本地 TUI。会话工作目录保护运行在
+Herdr server，因此 Mac 本机、mini 和 dorm-dev 的 server 也需要使用新构建。
+仅替换磁盘二进制不会改变已经运行的进程；需要通过受支持的 live handoff 生效，
+或等下次正常启动。不要为了生效杀掉主 server 或 Codex app-server。
 
-如果某台机器同时运行 Herdr 客户端和 server，则只要该机器的交互式客户端需要这个修复，就在那台机器上安装 fork 构建。远端会话、Codex app-server 和 Pairfob relay 的状态不通过这次客户端更新迁移。
+三个节点均使用自维护二进制。Herdr 的 live handoff 只接管 Herdr runtime；
+Codex app-server 和 Pairfob relay 各自仍有独立的进程与生命周期。
 
 ## 变更和推送纪律
 
