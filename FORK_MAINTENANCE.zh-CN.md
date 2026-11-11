@@ -142,13 +142,42 @@ LIBGHOSTTY_VT_ZIG_SYSTEM_DIR="$HOME/herdr-zig-system" \
 just check
 ```
 
-完整 release 构建使用：
+日常修改完成后，自用 release 构建固定使用：
 
 ```bash
 ZIG="$HOME/.local/share/herdr/zig-0.16.0/zig" \
 LIBGHOSTTY_VT_ZIG_SYSTEM_DIR="$HOME/herdr-zig-system" \
-just build
+just build-local
 ```
+
+上面的 Zig 路径是 M3 的本机约定；其他节点使用各自的 Zig 0.16.0 和缓存路径。
+提前按上一节导出这两个环境变量后，只需要运行 `just build-local`。
+
+未安装 `just` 时，导出 Zig 环境变量后可直接运行同一个构建脚本，无需额外安装工具：
+
+```bash
+bash scripts/build_local.sh
+```
+
+`just build-local` 调用这个脚本，仅用于 macOS/Linux 的 fork 日常构建，实际执行：
+
+```bash
+CARGO_INCREMENTAL=1 cargo build --release --locked --timings
+```
+
+它保留 release 默认优化级别，为本次构建启用 Rust 增量编译，并把耗时报告保存到
+`target/cargo-timings/`（设置 `CARGO_TARGET_DIR` 时位于对应目录下）。产物仍是
+`target/release/herdr`，与本机已有安装链接一致。`just build` 保留原有行为，
+需要按默认 release 设置验证时使用；CI 和发布构建不通过这个本地入口。
+
+首次启用增量编译需要建立缓存，后续以相同参数修改代码再构建时才能评估提速效果。
+保留 `target/` 和 Zig 缓存，不要在日常更新前运行 `cargo clean`；缓存会增加磁盘占用。
+修改工具链、依赖或构建参数可能触发重编译。无源码变化的再次构建只能验证缓存复用，
+不能代表修改源码后的编译耗时。
+
+连续开发时，可以先用 `cargo check --locked` 检查类型和语法，再运行受影响的测试
+（例如 `just test-one raw_input`），需要更新日常版本时再运行 `just build-local`。
+构建入口不执行测试，提交前仍按项目约定完成验证。
 
 release 优化构建可能明显慢于 debug 测试。构建开始后应先看 `ps` 确认仍有 `rustc` 或 `zig` 活动，不要把长时间没有终端输出误判成死锁。
 

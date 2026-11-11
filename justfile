@@ -88,6 +88,11 @@ build:
 build:
     python scripts/package_windows_conpty.py build-local
 
+# Build the local fork with release optimizations, incremental caching, and timings
+[unix]
+build-local:
+    bash scripts/build_local.sh
+
 # Non-gating full-render scaling profile for background workspaces and active panes
 bench-render-scale:
     cargo test --release --locked --bin herdr render_scale_profile -- --ignored --nocapture --test-threads=1
